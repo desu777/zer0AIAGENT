@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const solc = require('solc');
+const fs = require('fs');
 
 // Lista gotowych nazw tokenów
 const predefinedTokenNames = [
@@ -221,67 +222,384 @@ function compileContract(sourceCode, contractName) {
   }
 }
 
-// Endpoint do kompilacji kontraktu
-app.post('/compile', (req, res) => {
-    try {
-        let { tokenName, tokenSymbol, totalSupply, decimals } = req.body;
-        
-        // Jeśli nie podano nazwy tokena, wygeneruj losową
-        if (!tokenName) {
-            tokenName = generateTokenName();
-        }
-        
-        // Jeśli nie podano symbolu, wygeneruj losowy
-        if (!tokenSymbol) {
-            tokenSymbol = generateTokenSymbol();
-        }
-        
-        // Wygeneruj kod źródłowy
-        const contractName = tokenName.replace(/\s+/g, '').replace(/[^a-zA-Z0-9]/g, '');
-        const sourceCode = generateTokenContract(
-            tokenName,
-            tokenSymbol,
-            totalSupply || 1000000000,
-            decimals || 18
-        );
-        
-        // Skompiluj kontrakt
-        const compiledData = compileContract(sourceCode, contractName);
-        
-        // Zwróć bytecode i ABI
-        res.json({
-            success: true,
-            tokenName,
-            tokenSymbol,
-            sourceCode,
-            ...compiledData
-        });
-    } catch (error) {
-        console.error('Error in /compile:', error);
-        res.status(500).json({ error: error.message });
+// ==================== LIQUIDITY POOL FUNCTIONALITY (NEW) ====================
+
+// Generate liquidity pool contract
+function generateLiquidityPoolContract(poolName, tokenA, tokenB) {
+  const contractName = poolName.replace(/\s+/g, '').replace(/[^a-zA-Z0-9]/g, '');
+  
+  return `// SPDX-License-Identifier: MIT
+pragma solidity 0.7.5;
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+}
+
+contract ${contractName} {
+    address public owner;
+    IERC20 public tokenA; // First token
+    IERC20 public tokenB; // Second token
+    
+    uint256 public reserveA;
+    uint256 public reserveB;
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner");
+        _;
     }
+
+    constructor() {
+        owner = msg.sender;
+        // Używamy konwersji string na adres, aby uniknąć problemów z checksumem
+        tokenA = IERC20(${tokenA});
+        tokenB = IERC20(${tokenB});
+    }
+
+    // Add liquidity (only owner)
+    function addLiquidity(uint256 amountA, uint256 amountB) external onlyOwner {
+        tokenA.transferFrom(msg.sender, address(this), amountA);
+        tokenB.transferFrom(msg.sender, address(this), amountB);
+        reserveA += amountA;
+        reserveB += amountB;
+    }
+
+    // Swap TokenA for TokenB
+    function swapAforB(uint256 amountIn) external {
+        require(amountIn > 0, "Amount must be greater than 0");
+        
+        uint256 amountOut = (reserveB * amountIn) / (reserveA + amountIn);
+        
+        tokenA.transferFrom(msg.sender, address(this), amountIn);
+        tokenB.transfer(msg.sender, amountOut);
+        
+        reserveA += amountIn;
+        reserveB -= amountOut;
+    }
+
+    // Swap TokenB for TokenA
+    function swapBforA(uint256 amountIn) external {
+        require(amountIn > 0, "Amount must be greater than 0");
+        
+        uint256 amountOut = (reserveA * amountIn) / (reserveB + amountIn);
+        
+        tokenB.transferFrom(msg.sender, address(this), amountIn);
+        tokenA.transfer(msg.sender, amountOut);
+        
+        reserveB += amountIn;
+        reserveA -= amountOut;
+    }
+
+    // Remove liquidity (only owner)
+    function removeLiquidity(uint256 amountA, uint256 amountB) external onlyOwner {
+        require(amountA <= reserveA && amountB <= reserveB, "Insufficient reserves");
+        
+        tokenA.transfer(msg.sender, amountA);
+        tokenB.transfer(msg.sender, amountB);
+        
+        reserveA -= amountA;
+        reserveB -= amountB;
+    }
+}`;
+}
+
+// ==================== API ENDPOINTS ====================
+
+// 1. Istniejący endpoint do kompilacji tokenów
+app.post('/compile', (req, res) => {
+  try {
+    const { tokenName, tokenSymbol, totalSupply, decimals, sourceCode } = req.body;
+    
+    // Jeśli podano kod źródłowy, skompiluj go bezpośrednio
+    if (sourceCode) {
+      // Wyciągnij nazwę kontraktu z kodu źródłowego
+      const contractNameMatch = sourceCode.match(/contract\s+(\w+)/);
+      const contractName = contractNameMatch ? contractNameMatch[1] : 'CustomContract';
+      
+      const compiledData = compileContract(sourceCode, contractName);
+      
+      return res.json({
+        success: true,
+        sourceCode,
+        ...compiledData
+      });
+    }
+    
+    // W przeciwnym razie wygeneruj i skompiluj token na podstawie parametrów
+    let finalTokenName = tokenName;
+    let finalTokenSymbol = tokenSymbol;
+    
+    // Wygeneruj kod tokena
+    const generatedSourceCode = generateTokenContract(
+      finalTokenName,
+      finalTokenSymbol,
+      totalSupply || 1000000000,
+      decimals || 18
+    );
+    
+    // Wyciągnij nazwę kontraktu
+    const contractName = finalTokenName.replace(/\s+/g, '').replace(/[^a-zA-Z0-9]/g, '');
+    
+    // Skompiluj
+    const compiledData = compileContract(generatedSourceCode, contractName);
+    
+    // Zwróć dane
+    res.json({
+      success: true,
+      tokenName: finalTokenName,
+      tokenSymbol: finalTokenSymbol,
+      sourceCode: generatedSourceCode,
+      ...compiledData
+    });
+  } catch (error) {
+    console.error('Error in /compile:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 2. NOWY ENDPOINT: Kompilacja kontraktu puli płynności
+app.post('/compile-pool', (req, res) => {
+  try {
+    const { poolName, tokenA, tokenB, sourceCode } = req.body;
+    
+    // Jeśli podano kod źródłowy, skompiluj go bezpośrednio
+    if (sourceCode) {
+      // Wyciągnij nazwę kontraktu z kodu źródłowego
+      const contractNameMatch = sourceCode.match(/contract\s+(\w+)/);
+      const contractName = contractNameMatch ? contractNameMatch[1] : 'LiquidityPool';
+      
+      const compiledData = compileContract(sourceCode, contractName);
+      
+      return res.json({
+        success: true,
+        sourceCode,
+        ...compiledData
+      });
+    }
+    
+    // Walidacja danych wejściowych
+    if (!poolName) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Pool name is required" 
+      });
+    }
+    
+    if (!tokenA || !tokenB) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Both token addresses are required" 
+      });
+    }
+    
+    // Generowanie kodu kontraktu puli ze zweryfikowanym formatem adresów
+    const contractName = poolName.replace(/\s+/g, '').replace(/[^a-zA-Z0-9]/g, '');
+    
+    // Stałe adresy bez checksumowania (dla bezpieczeństwa)
+    const generatedSourceCode = `// SPDX-License-Identifier: MIT
+pragma solidity 0.7.5;
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+}
+
+contract ${contractName} {
+    address public owner;
+    IERC20 public tokenA; // First token
+    IERC20 public tokenB; // Second token
+    
+    uint256 public reserveA;
+    uint256 public reserveB;
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner");
+        _;
+    }
+
+    constructor() {
+        owner = msg.sender;
+        // Direct hexadecimal address literals
+        tokenA = IERC20(address(uint160(0x${tokenA.substring(2)})));
+        tokenB = IERC20(address(uint160(0x${tokenB.substring(2)})));
+    }
+
+    // Add liquidity (only owner)
+    function addLiquidity(uint256 amountA, uint256 amountB) external onlyOwner {
+        tokenA.transferFrom(msg.sender, address(this), amountA);
+        tokenB.transferFrom(msg.sender, address(this), amountB);
+        reserveA += amountA;
+        reserveB += amountB;
+    }
+
+    // Swap TokenA for TokenB
+    function swapAforB(uint256 amountIn) external {
+        require(amountIn > 0, "Amount must be greater than 0");
+        
+        uint256 amountOut = (reserveB * amountIn) / (reserveA + amountIn);
+        
+        tokenA.transferFrom(msg.sender, address(this), amountIn);
+        tokenB.transfer(msg.sender, amountOut);
+        
+        reserveA += amountIn;
+        reserveB -= amountOut;
+    }
+
+    // Swap TokenB for TokenA
+    function swapBforA(uint256 amountIn) external {
+        require(amountIn > 0, "Amount must be greater than 0");
+        
+        uint256 amountOut = (reserveA * amountIn) / (reserveB + amountIn);
+        
+        tokenB.transferFrom(msg.sender, address(this), amountIn);
+        tokenA.transfer(msg.sender, amountOut);
+        
+        reserveB += amountIn;
+        reserveA -= amountOut;
+    }
+
+    // Remove liquidity (only owner)
+    function removeLiquidity(uint256 amountA, uint256 amountB) external onlyOwner {
+        require(amountA <= reserveA && amountB <= reserveB, "Insufficient reserves");
+        
+        tokenA.transfer(msg.sender, amountA);
+        tokenB.transfer(msg.sender, amountB);
+        
+        reserveA -= amountA;
+        reserveB -= amountB;
+    }
+}`;
+    
+    // Kompilacja
+    const compiledData = compileContract(generatedSourceCode, contractName);
+    
+    // Zwróć dane
+    res.json({
+      success: true,
+      poolName,
+      tokenA,
+      tokenB,
+      sourceCode: generatedSourceCode,
+      ...compiledData
+    });
+  } catch (error) {
+    console.error('Error in /compile-pool:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 3. NOWY ENDPOINT: Weryfikacja tokena
+app.post('/verify-token', (req, res) => {
+  try {
+    const { tokenAddress } = req.body;
+    
+    if (!tokenAddress) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Token address is required" 
+      });
+    }
+    
+    // W rzeczywistej implementacji, tutaj byłaby weryfikacja tokena on-chain
+    // Tutaj dla demonstracji zwracamy sukces
+    res.json({
+      success: true,
+      tokenAddress,
+      verified: true,
+      message: "Token verification would be performed here in a real implementation"
+    });
+  } catch (error) {
+    console.error('Error in /verify-token:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 4. NOWY ENDPOINT: Generowanie kontraktu do zatwierdzania tokenów
+app.post('/generate-approver', (req, res) => {
+  try {
+    const { tokenAddress, spenderAddress, amount, decimals = 18 } = req.body;
+    
+    if (!tokenAddress) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Token address is required" 
+      });
+    }
+    
+    if (!spenderAddress) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Spender address is required" 
+      });
+    }
+    
+    // Przekształć wartość z uwzględnieniem decimals
+    const actualAmount = amount || '0';
+    const amountWithDecimals = `${actualAmount} * (10 ** ${decimals})`;
+    
+    // Wygeneruj kod kontraktu TokenApprover
+    const sourceCode = `// SPDX-License-Identifier: MIT
+pragma solidity 0.7.5;
+
+interface IERC20 {
+    function approve(address spender, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+}
+
+contract TokenApprover {
+    IERC20 public token = IERC20(${tokenAddress});
+    address public spender = ${spenderAddress};
+    
+    function approveToken() public {
+        token.approve(spender, ${amountWithDecimals});
+    }
+    
+    function checkAllowance() public view returns (uint256) {
+        return token.allowance(address(this), spender);
+    }
+}`;
+    
+    // Skompiluj kontrakt
+    const compiledData = compileContract(sourceCode, "TokenApprover");
+    
+    res.json({
+      success: true,
+      tokenAddress,
+      spenderAddress,
+      amount: actualAmount,
+      decimals,
+      sourceCode,
+      ...compiledData
+    });
+  } catch (error) {
+    console.error('Error in /generate-approver:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 // Endpoint statusu
 app.get('/', (req, res) => {
-    res.json({
-        status: 'Solidity Compiler Service running',
-        availableTokenNames: {
-            predefined: predefinedTokenNames.length,
-            components: nameOptions.length,
-            suffixes: suffixOptions.length,
-            symbols: symbolOptions.length,
-            totalPossibleCombinations: predefinedTokenNames.length + (nameOptions.length * (1 + suffixOptions.length))
-        },
-        endpoints: {
-            '/': 'Status endpoint',
-            '/compile': 'POST endpoint to compile contracts'
-        }
-    });
+  res.json({
+    status: 'Solidity Compiler Service running',
+    endpoints: {
+      '/': 'Status endpoint',
+      '/compile': 'POST endpoint to compile token contracts',
+      '/compile-pool': 'POST endpoint to compile liquidity pool contracts',
+      '/verify-token': 'POST endpoint to verify token addresses'
+    }
+  });
 });
 
-// Uruchomienie serwera
+// Start serwera
 app.listen(PORT, () => {
   console.log(`Solidity Compiler Service running on port ${PORT}`);
-  console.log(`Try it: curl -X POST http://localhost:${PORT}/compile -H "Content-Type: application/json" -d '{"tokenName":"Zer0 Token","tokenSymbol":"ZER0"}'`);
+  console.log(`API endpoints available at http://localhost:${PORT}`);
 }); 
